@@ -3,6 +3,8 @@ name = "viscous"
 version = "0.0.0"
 authors = ["Jake Swenson <jake@jakeswenson.com>"]
 edition = "2018"
+description = "A SSH Honeypot with support for virtual filesystems and support "
+license = "MIT"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
