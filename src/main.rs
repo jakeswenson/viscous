@@ -1,4 +1,6 @@
 use futures::Future;
+use lru::LruCache;
+use mini_fs::MiniFs;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use thrussh::server::{Auth, Session};
@@ -18,7 +20,7 @@ async fn main() {
     let config = Arc::new(config);
     let sh = Server {
         client_pubkey,
-        clients: Arc::new(Mutex::new(HashMap::new())),
+        clients: Arc::new(Mutex::new(LruCache::new(10))),
         id: 0,
     };
     tokio::time::timeout(
@@ -29,23 +31,56 @@ async fn main() {
     .unwrap_or(Ok(()));
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 struct Server {
     client_pubkey: Arc<thrussh_keys::key::PublicKey>,
-    clients: Arc<Mutex<HashMap<(usize, ChannelId), thrussh::server::Handle>>>,
+    clients: Arc<Mutex<lru::LruCache<HoneypotChannel, thrussh::server::Handle>>>,
     id: usize,
 }
 
+#[derive(Debug, Hash, Clone, Eq, Ord, PartialOrd, PartialEq, Copy)]
+struct HoneypotId(usize);
+
+#[derive(Debug, Hash, Clone)]
+struct HoneypotChannel {
+    honeypot_id: HoneyPotId,
+    channel_id: ChannelId,
+}
+
+enum AuthStrategy {
+    None,
+    AllowAnyUserPassword,
+}
+
+#[derive(Debug, Hash, Clone, Eq, Ord, PartialOrd, PartialEq, Copy)]
+struct Username(String);
+
+#[derive(Debug, Clone)]
+struct Honeypot {
+    honeypot_id: HoneyPotId,
+    victim_ip_address: Option<std::net::SocketAddr>,
+    auth_strategy: AuthStrategy,
+    virtual_file_system: mini_fs::MiniFs,
+    environment: HashMap<String, String>,
+    logins: Arc<LruCache<Username, Context>>,
+}
+
+struct Context {}
+
 impl server::Server for Server {
-    type Handler = Self;
-    fn new(&mut self, _: Option<std::net::SocketAddr>) -> Self {
+    type Handler = HoneyPot;
+    fn new(&mut self, client_ip: Option<std::net::SocketAddr>) -> Self::Handler {
         let s = self.clone();
         self.id += 1;
-        s
+        Honeypot {
+            victim_ip_address: client_ip,
+            auth_strategy: AuthStrategy::AllowAnyUserPassword,
+            virtual_file_system: MiniFs::new(),
+        }
     }
 }
 
-impl server::Handler for Server {
+impl server::Handler for Honeypot {
     type FutureAuth = futures::future::Ready<Result<server::Auth, failure::Error>>;
     type FutureUnit = futures::future::Ready<Result<(), failure::Error>>;
     type FutureBool = futures::future::Ready<Result<bool, failure::Error>>;
@@ -53,12 +88,19 @@ impl server::Handler for Server {
     fn finished_auth(&mut self, auth: Auth) -> Self::FutureAuth {
         futures::future::ready(Ok(auth))
     }
+
     fn finished_bool(&mut self, b: bool, s: &mut Session) -> Self::FutureBool {
         futures::future::ready(Ok(b))
     }
+
     fn finished(&mut self, s: &mut Session) -> Self::FutureUnit {
         futures::future::ready(Ok(()))
     }
+
+    fn auth_password(&mut self, user: &str, password: &str) -> Self::FutureAuth {
+        self.finished_auth(Auth::Reject)
+    }
+
     fn channel_open_session(
         &mut self,
         channel: ChannelId,
@@ -69,9 +111,6 @@ impl server::Handler for Server {
             clients.insert((self.id, channel), session.handle());
         }
         self.finished(session)
-    }
-    fn auth_publickey(&mut self, _: &str, _: &key::PublicKey) -> Self::FutureAuth {
-        self.finished_auth(server::Auth::Accept)
     }
     fn data(
         &mut self,
